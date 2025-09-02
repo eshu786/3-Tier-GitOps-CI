@@ -11,10 +11,24 @@ permissions:
 
 env:
   IMAGE_TAG: ${{ github.sha }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
+  slack_notify:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.notify.outputs.result }}
+    steps:
+      - name: Notify Slack - CI started
+        id: notify
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"CI workflow started for branch '${GITHUB_REF}' commit '${GITHUB_SHA}'"}' \
+            $SLACK_WEBHOOK_URL
+
   compile:
     runs-on: ubuntu-latest
+    needs: slack_notify
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,7 +36,7 @@ jobs:
       - name: Set up Node.js (LTS recommended)
         uses: actions/setup-node@v4
         with:
-          node-version: '23'   # use LTS if you don't need v23
+          node-version: '23'
 
       - name: Frontend Compilation (Syntax Check)
         run: |
@@ -139,7 +153,7 @@ jobs:
           scan-type: image
           image-ref: eshu786/backend:${{ env.IMAGE_TAG }}
           format: table
-          exit-code: '0'                 # set to '1' to fail on vulns
+          exit-code: '0'
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
@@ -173,28 +187,10 @@ jobs:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
           curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq && sudo install yq /usr/local/bin/yq
-
-          # -- Safety cleanup: remove any accidental .spec.template from Service docs
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/backend.yaml
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/frontend.yaml
-
-          # -- Update ONLY Deployment images (backend)
-          yq -i '
-            (. | select(.kind=="Deployment")
-               | .spec.template.spec.containers[]
-               | select(.name=="backend")
-               | .image)
-            = "eshu786/backend:" + strenv(IMAGE_TAG)
-          ' k8s-prod/backend.yaml
-
-          # -- Update ONLY Deployment images (frontend)
-          yq -i '
-            (. | select(.kind=="Deployment")
-               | .spec.template.spec.containers[]
-               | select(.name=="frontend")
-               | .image)
-            = "eshu786/frontend:" + strenv(IMAGE_TAG)
-          ' k8s-prod/frontend.yaml
+          yq -i '(. | select(.kind=="Deployment") | .spec.template.spec.containers[] | select(.name=="backend") | .image) = "eshu786/backend:" + strenv(IMAGE_TAG)' k8s-prod/backend.yaml
+          yq -i '(. | select(.kind=="Deployment") | .spec.template.spec.containers[] | select(.name=="frontend") | .image) = "eshu786/frontend:" + strenv(IMAGE_TAG)' k8s-prod/frontend.yaml
 
       - name: Commit & push to CD repo
         working-directory: cd
@@ -204,3 +200,23 @@ jobs:
           git add -A
           git commit -m "bump images to ${IMAGE_TAG}" || echo "no changes"
           git push
+
+  notify_slack_success:
+    runs-on: ubuntu-latest
+    needs: update_cd_repo
+    steps:
+      - name: Notify Slack - CI SUCCESS
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"✅ CI workflow SUCCESSFUL for branch '${GITHUB_REF}' commit '${GITHUB_SHA}'"}' \
+            $SLACK_WEBHOOK_URL
+
+  notify_slack_failure:
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Notify Slack - CI FAILED
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"❌ CI workflow FAILED for branch '${GITHUB_REF}' commit '${GITHUB_SHA}'"}' \
+            $SLACK_WEBHOOK_URL
