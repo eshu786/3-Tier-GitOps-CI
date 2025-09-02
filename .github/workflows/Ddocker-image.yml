@@ -7,10 +7,11 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: write   # required to push to CD repo with GITHUB_TOKEN or PAT
+  contents: write
 
 env:
   IMAGE_TAG: ${{ github.sha }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
 jobs:
   compile:
@@ -18,18 +19,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Node.js (LTS recommended)
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '23'   # use LTS if you don't need v23
-
-      - name: Frontend Compilation (Syntax Check)
+          node-version: '23'
+      - name: Frontend Compilation
         run: |
           cd client
           find . -name "*.js" -exec node --check {} +
-
-      - name: Backend Compilation (Syntax Check)
+      - name: Backend Compilation
         run: |
           cd api
           find . -name "*.js" -exec node --check {} +
@@ -40,10 +38,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Gitleaks Setup
         uses: gitleaks/gitleaks-action@v2
-
       - name: Gitleaks Scan
         run: |
           gitleaks detect --source ./client --exit-code 1
@@ -55,8 +51,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Run Trivy vulnerability scanner (FS)
+      - name: Run Trivy FS Scan
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: fs
@@ -72,20 +67,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Login to Docker Hub
+      - name: Docker Login
         uses: docker/login-action@v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker image (backend)
+      - name: Build & Push Backend Image
         uses: docker/build-push-action@v6
         with:
           context: ./api
@@ -101,20 +92,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Login to Docker Hub
+      - name: Docker Login
         uses: docker/login-action@v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker image (frontend)
+      - name: Build & Push Frontend Image
         uses: docker/build-push-action@v6
         with:
           context: ./client
@@ -130,21 +117,19 @@ jobs:
       - build_backend_docker_image_and_push
       - build_frontend_docker_image_and_push
     steps:
-      - name: Checkout (noop, keeps workspace consistent)
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Run Trivy image scan for backend
+      - name: Trivy Image Scan Backend
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: image
           image-ref: eshu786/backend:${{ env.IMAGE_TAG }}
           format: table
-          exit-code: '0'                 # set to '1' to fail on vulns
+          exit-code: '0'
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
-
-      - name: Run Trivy image scan for frontend
+      - name: Trivy Image Scan Frontend
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: image
@@ -159,44 +144,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: trivy_image_scan
     steps:
-      - name: Checkout CD repo
+      - name: Checkout CD Repo
         uses: actions/checkout@v4
         with:
           repository: eshu786/3-Tier-GitOps-CD
           ref: main
           token: ${{ secrets.CD_REPO_TOKEN }}
           path: cd
-
-      - name: Bump images in manifests (safe)
+      - name: Bump Images in Manifests
         working-directory: cd
         env:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
           curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq && sudo install yq /usr/local/bin/yq
-
-          # -- Safety cleanup: remove any accidental .spec.template from Service docs
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/backend.yaml
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/frontend.yaml
-
-          # -- Update ONLY Deployment images (backend)
-          yq -i '
-            (. | select(.kind=="Deployment")
-               | .spec.template.spec.containers[]
-               | select(.name=="backend")
-               | .image)
-            = "eshu786/backend:" + strenv(IMAGE_TAG)
-          ' k8s-prod/backend.yaml
-
-          # -- Update ONLY Deployment images (frontend)
-          yq -i '
-            (. | select(.kind=="Deployment")
-               | .spec.template.spec.containers[]
-               | select(.name=="frontend")
-               | .image)
-            = "eshu786/frontend:" + strenv(IMAGE_TAG)
-          ' k8s-prod/frontend.yaml
-
-      - name: Commit & push to CD repo
+          yq -i '(. | select(.kind=="Deployment") | .spec.template.spec.containers[] | select(.name=="backend") | .image) = "eshu786/backend:" + strenv(IMAGE_TAG)' k8s-prod/backend.yaml
+          yq -i '(. | select(.kind=="Deployment") | .spec.template.spec.containers[] | select(.name=="frontend") | .image) = "eshu786/frontend:" + strenv(IMAGE_TAG)' k8s-prod/frontend.yaml
+      - name: Commit & Push to CD Repo
         working-directory: cd
         run: |
           git config user.name "ci-bot"
@@ -204,3 +169,14 @@ jobs:
           git add -A
           git commit -m "bump images to ${IMAGE_TAG}" || echo "no changes"
           git push
+
+  notify_slack_success:
+    runs-on: ubuntu-latest
+    needs: update_cd_repo
+    if: success()
+    steps:
+      - name: Notify Slack - SUCCESS with GIF
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"✅ CI/CD SUCCESSFUL! Branch: '${GITHUB_REF}' commit: '${GITHUB_SHA}' 🎉","blocks":[{"type":"image","image_url":"https://media.giphy.com/media/111ebonMs90YLu/giphy.gif","alt_text":"success"}]}' \
+            $SLACK_WEBHOOK_URL
